@@ -45,22 +45,103 @@ jobs:
       - name: Sync upstream changes
         id: sync
         if: steps.breaking_guard.outputs.blocked != 'true'
-        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
-        with:
-          upstream_sync_repo: MarSeventh/CloudFlare-ImgBed
-          upstream_sync_branch: main
-          target_sync_branch: main
-          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
-          test_mode: false
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+
+          # The breaking-update guard has already fetched this upstream ref.
+          upstream_ref="refs/remotes/cloudflare-imgbed-upstream/main"
+          notice_title="[Upstream Sync] Manual Sync fork required"
+          echo "changed=false" >> "$GITHUB_OUTPUT"
+          echo "manual_required=false" >> "$GITHUB_OUTPUT"
+
+          find_notice() {
+            gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 200 \
+              --json number,title \
+              --jq '.[] | select(.title == "[Upstream Sync] Manual Sync fork required") | .number' | head -n 1
+          }
+
+          close_notice() {
+            local number
+            number="$(find_notice || true)"
+            if [[ -n "$number" ]]; then
+              gh issue comment "$number" --repo "$GITHUB_REPOSITORY" \
+                --body "Upstream is integrated into main; this manual-sync notice is resolved." >/dev/null || true
+              gh issue close "$number" --repo "$GITHUB_REPOSITORY" --reason completed >/dev/null || true
+            fi
+          }
+
+          before="$(gh api "repos/$GITHUB_REPOSITORY/branches/main" --jq '.commit.sha')"
+          upstream="$(git rev-parse "$upstream_ref")"
+          git fetch --quiet origin main
+
+          # A fork-specific fix may make main ahead of upstream; that is not a reason to sync.
+          if git merge-base --is-ancestor "$upstream" "$before"; then
+            echo "Already contains the latest upstream commit."
+            echo "## ✅ Upstream already integrated" >> "$GITHUB_STEP_SUMMARY"
+            close_notice
+            exit 0
+          fi
+
+          base="$(git merge-base "$before" "$upstream")"
+          workflow_changes="$(git diff --name-only "$base" "$upstream" -- '.github/workflows/')"
+          error_file="$(mktemp)"
+          trap 'rm -f "$error_file"' EXIT
+
+          # GitHub's native fork-sync endpoint needs only contents:write.
+          # If it rejects workflow changes, do not request or use a privileged token.
+          if ! gh api --method POST "repos/$GITHUB_REPOSITORY/merge-upstream" \
+              -f branch=main >/dev/null 2>"$error_file"; then
+            if grep -Eiq 'HTTP (403|409|422)|workflows? permission' "$error_file"; then
+              number="$(find_notice || true)"
+              if [[ -z "$number" ]]; then
+                body="$(printf 'Native fork synchronization requires manual review (permission or merge conflict).\n\nFork HEAD before attempt: %s\nUpstream HEAD: %s\nUpstream workflow changes:\n%s\n\nReview the changes and use **Sync fork → Update branch** on https://github.com/%s . Do not create a high-permission token. Automatic checks will continue, and this issue will be closed after the upstream commit is integrated.\n' "$before" "$upstream" "$workflow_changes" "$GITHUB_REPOSITORY")"
+                gh issue create --repo "$GITHUB_REPOSITORY" \
+                  --title "$notice_title" --body "$body" >/dev/null
+              fi
+              echo "manual_required=true" >> "$GITHUB_OUTPUT"
+              echo "::warning::Native upstream sync needs manual review. See the open Upstream Sync issue."
+              {
+                echo "## ⚠️ Upstream sync needs manual review"
+                echo
+                echo "GitHub rejected the native sync or found a merge conflict. No privileged token was requested."
+                echo "Use **Sync fork → Update branch** after reviewing upstream changes."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "::error::Native GitHub fork sync API failed unexpectedly."
+            cat "$error_file" >&2
+            exit 1
+          fi
+
+          after="$(gh api "repos/$GITHUB_REPOSITORY/branches/main" --jq '.commit.sha')"
+          git fetch --quiet origin main
+          if ! git merge-base --is-ancestor "$upstream" "$after"; then
+            echo "::error::Sync response succeeded but the upstream commit is not in main."
+            exit 1
+          fi
+
+          if [[ "$after" != "$before" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          close_notice
+          {
+            echo "## ✅ GitHub native upstream sync completed"
+            echo
+            echo "Before: \`$before\`"
+            echo "After: \`$after\`"
+            echo "Upstream integrated: \`$upstream\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Complete breaking update notices
-        if: steps.sync.outcome == 'success'
+        if: steps.sync.outcome == 'success' && steps.sync.outputs.manual_required != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash .github/breaking-updates/scripts/breaking-update-guard.sh complete
 
       - name: Trigger Worker deploy
-        if: steps.sync.outcome == 'success'
+        if: steps.sync.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh workflow run deploy-worker.yml --repo "${{ github.repository }}" --ref main
